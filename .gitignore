@@ -1,0 +1,47 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ===== Virtual environment =====
+venv/
+.venv/
+env/
+ENV/
+library/
+root/
+
+# ===== Logs =====
+*.log
+analyzer.log
+
+# ===== Configs (если не хочешь коммитить локальные настройки) =====
+config.ini
+
+# ===== Audio files =====
+*.wav
+*.mp3
+IWAV/
+MP3/
+
+# ===== Analysis outputs =====
+TRANSCRIPTS/
+DIARIZATION/
+JSON/
+HTML/
+
+# ===== Temporary / generated data =====
+*.tmp
+*.temp
+*.cache
+
+# ===== OS / IDE =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ===== Reports / artifacts =====
+reporter_output/
