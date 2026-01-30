@@ -15,13 +15,10 @@ AUDIO_BASE_URL = cfg.get("BITRIX", "audio_base_url")
 TMP_DIR = cfg.get("BITRIX", "tmp_dir", fallback=os.path.join(os.getcwd(), "tmp"))
 
 os.makedirs(TMP_DIR, exist_ok=True)
-
 logger = logging.getLogger("analyzer")
-
 
 class BitrixClient:
     def __init__(self):
-        # Убираем конечный слеш, чтобы корректно конкатенировать методы
         self.webhook_url = BITRIX_WEBHOOK.rstrip("/") + "/"
 
     # ------------------------
@@ -38,45 +35,24 @@ class BitrixClient:
     # ------------------------
     # Поиск активности по CALL_ID (Origin ID телефонии)
     # ------------------------
-
     def find_activity_by_call_id(self, call_id: str) -> Dict:
-        """
-        Ищет CRM activity типа CALL по ORIGIN_ID
-        """
         url = self.webhook_url + "crm.activity.list.json"
         params = {
-            "filter": {
-                "TYPE_ID": 2,  # CALL
-                "ORIGIN_ID": call_id
-            },
-            "select": [
-                "ID",
-                "OWNER_ID",
-                "OWNER_TYPE_ID",
-                "FILES"
-            ]
+            "filter": {"TYPE_ID": 2, "ORIGIN_ID": call_id},
+            "select": ["ID","OWNER_ID","OWNER_TYPE_ID","FILES"]
         }
-
         resp = requests.post(url, json=params)
         if resp.status_code != 200:
-            logger.error(
-                "Failed to find activity by CALL_ID %s: %s",
-                call_id, resp.text
-            )
+            logger.error("Failed to find activity by CALL_ID %s: %s", call_id, resp.text)
             return {}
-
         items = resp.json().get("result", [])
         return items[0] if items else {}
 
     # ------------------------
     # Скачивание аудио по fileId
     # ------------------------
-    def download_audio(self, file_id: str) -> str:
-        """
-        Скачиваем MP3 через crm_show_file.php
-        Возвращаем локальный путь
-        """
-        url = f"{AUDIO_BASE_URL}{file_id}"
+    def download_audio(self, file_id: str, file_url: str = None) -> str:
+        url = file_url if file_url else f"{AUDIO_BASE_URL}{file_id}"
         local_path = os.path.join(TMP_DIR, f"{file_id}.mp3")
         try:
             resp = requests.get(url, stream=True)
@@ -97,38 +73,21 @@ class BitrixClient:
     # Добавление комментария в карточку лида/сделки
     # ------------------------
     def add_comment(self, owner_type_id: int, owner_id: int, text: str):
-        """
-        Добавляет комментарий в timeline лида/сделки
-        """
         url = self.webhook_url + "crm.timeline.comment.add.json"
-        data = {
-            "fields": {
-                "ENTITY_TYPE_ID": owner_type_id,  # 1=lead, 2=deal
-                "ENTITY_ID": owner_id,
-                "COMMENT": text
-            }
-        }
-
+        data = {"fields": {"ENTITY_TYPE_ID": owner_type_id, "ENTITY_ID": owner_id, "COMMENT": text}}
         resp = requests.post(url, json=data)
         if resp.status_code != 200:
-            logger.error(
-                "Failed to add timeline comment to %s %s: %s",
-                owner_type_id, owner_id, resp.text
-            )
+            logger.error("Failed to add timeline comment to %s %s: %s", owner_type_id, owner_id, resp.text)
         else:
-            logger.info(
-                "Added timeline comment to %s %s",
-                owner_type_id, owner_id
-            )
+            logger.info("Added timeline comment to %s %s", owner_type_id, owner_id)
 
     # ------------------------
     # Обновление пользовательских полей
     # ------------------------
     def update_fields(self, entity_id: int, fields: Dict, entity_type="lead"):
-        method = "crm.lead.update.json" if entity_type == "lead" else "crm.deal.update.json"
+        method = "crm.lead.update.json" if entity_type=="lead" else "crm.deal.update.json"
         url = self.webhook_url + method
         data = {"id": entity_id, "fields": fields}
-
         resp = requests.post(url, json=data)
         if resp.status_code != 200:
             logger.error("Failed to update %s %s: %s", entity_type, entity_id, resp.text)
