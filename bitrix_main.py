@@ -1,6 +1,6 @@
 import os
-import logging
 import gc
+import logging
 import configparser
 import tempfile
 import threading
@@ -24,9 +24,8 @@ cfg = configparser.ConfigParser()
 cfg.read("config.ini", encoding="utf-8")
 
 WHISPER_MODEL = cfg.get("WHISPER", "model")
-TMP_DIR = cfg.get("BITRIX", "tmp_dir", fallback=tempfile.gettempdir())
 EXPECTED_APP_TOKEN = cfg.get("BITRIX", "outgoing_app_token")
-AUDIO_BASE_URL = cfg.get("BITRIX", "audio_base_url")
+TMP_DIR = cfg.get("BITRIX", "tmp_dir", fallback=tempfile.gettempdir())
 
 REQUIRED_PHRASES = [
     p.strip()
@@ -39,7 +38,7 @@ os.makedirs(TMP_DIR, exist_ok=True)
 # ==================================================
 # LOGGING
 # ==================================================
-logger = logging.getLogger("bitrix_analyzer")
+logger = logging.getLogger("bitrix_main")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
@@ -79,15 +78,15 @@ diarizer = SimpleFallbackDiarizer()
 # INTERNAL STATE
 # ==================================================
 PROCESSING_LOCK = set()
-MAX_RETRY = 6           # ~6 минут ожидания MP3
-RETRY_DELAY = 60        # секунд
+MAX_RETRY = 6
+RETRY_DELAY = 60
 
 # ==================================================
-# MAIN CALL PROCESSOR
+# CALL PROCESSOR
 # ==================================================
 def process_call(activity_id: int, attempt: int = 1):
     if activity_id in PROCESSING_LOCK:
-        logger.info(f"[{activity_id}] Уже в обработке — пропуск")
+        logger.info("[%s] Already processing", activity_id)
         return
 
     PROCESSING_LOCK.add(activity_id)
@@ -95,48 +94,41 @@ def process_call(activity_id: int, attempt: int = 1):
     audio_path = None
 
     try:
-        logger.info(f"[{activity_id}] Попытка {attempt}: получение активности")
+        logger.info("[%s] Attempt %s: get activity", activity_id, attempt)
         activity = client.get_call_activity(activity_id)
+
         if not activity:
-            logger.error(f"[{activity_id}] CRM activity не найдена")
+            logger.error("[%s] Activity not found", activity_id)
             return
 
-        # -------- FILE_ID / URL --------
+        # -------- FILE_ID --------
         file_id = None
-        file_url = None
-
-        if activity.get("FILES") and len(activity["FILES"]) > 0:
-            file_entry = activity["FILES"][0]
-            file_id = str(file_entry.get("id") or file_entry.get("FILE_ID"))
-            file_url = file_entry.get("url")  # используем готовый URL, если есть
-        elif activity.get("FILE_ID"):
-            file_id = str(activity.get("FILE_ID"))
-            file_url = AUDIO_BASE_URL + file_id
+        files = activity.get("FILES") or []
+        if files:
+            file_id = str(files[0].get("id") or files[0].get("FILE_ID"))
 
         if not file_id:
             if attempt < MAX_RETRY:
-                logger.info(f"[{activity_id}] FILE_ID нет, повтор через {RETRY_DELAY} сек")
+                logger.info("[%s] FILE_ID not ready, retry in %s sec", activity_id, RETRY_DELAY)
                 threading.Timer(RETRY_DELAY, process_call, args=(activity_id, attempt + 1)).start()
             else:
-                logger.warning(f"[{activity_id}] FILE_ID так и не появился — отказ")
+                logger.warning("[%s] FILE_ID not found after retries", activity_id)
             return
 
-        logger.info(f"[{activity_id}] FILE_ID найден: {file_id}, URL: {file_url}")
+        logger.info("[%s] FILE_ID: %s", activity_id, file_id)
 
         # -------- DOWNLOAD AUDIO --------
-        audio_path = client.download_audio(file_id, file_url=file_url)
+        audio_path = client.download_audio(file_id)
         if not audio_path:
-            logger.error(f"[{activity_id}] Ошибка скачивания аудио")
+            logger.error("[%s] Audio download failed", activity_id)
             return
-
-        logger.info(f"[{activity_id}] Аудио скачано: {audio_path}")
 
         # -------- WHISPER --------
         try:
             segments = whisper_engine.transcribe_segments(audio_path)
             full_text = " ".join(s.get("text", "") for s in segments).strip()
         except Exception:
-            logger.exception(f"[{activity_id}] Ошибка Whisper")
+            logger.exception("[%s] Whisper failed", activity_id)
             full_text = ""
             segments = []
 
@@ -152,30 +144,33 @@ def process_call(activity_id: int, attempt: int = 1):
         owner_id = activity.get("OWNER_ID")
         owner_type = activity.get("OWNER_TYPE_ID")
 
-        comment_text = (
-            "📞 <b>Автоматический анализ звонка</b><br><br>"
-            f"<b>Скрипт:</b> {script_result.get('percent', 0)}%<br>"
-            f"<b>Информативный:</b> {'Да' if informative else 'Нет'}<br>"
-            f"<b>Пропущенные фразы:</b> "
-            f"{', '.join(script_result.get('missing', [])) or '—'}"
-        )
+        comment_lines = [
+            "📞 Автоматический анализ звонка",
+            f"Скрипт: {len(script_result.get('found', []))}/{len(REQUIRED_PHRASES)} фраз найдено",
+            f"Информативный: {'Да' if informative else 'Нет'}",
+            f"Пропущенные фразы: {', '.join(script_result.get('missed', [])) or '—'}"
+        ]
+        comment_text = "\n".join(comment_lines)
 
-        client.add_comment(owner_type_id=owner_type, owner_id=owner_id, text=comment_text)
-        logger.info(f"[{activity_id}] Анализ успешно завершён")
+        logger.info("[%s] Sending comment to Bitrix...", activity_id)
+        client.add_comment(owner_type, owner_id, comment_text)
+        logger.info("[%s] Analysis completed", activity_id)
 
     except Exception:
-        logger.exception(f"[{activity_id}] Критическая ошибка")
+        logger.exception("[%s] Critical error", activity_id)
 
     finally:
         PROCESSING_LOCK.discard(activity_id)
+
         try:
             if audio_path and os.path.exists(audio_path):
                 os.remove(audio_path)
         except Exception:
             pass
+
         gc.collect()
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"[{activity_id}] Завершено за {elapsed:.1f} сек")
+        logger.info("[%s] Finished in %.1f sec", activity_id, elapsed)
 
 # ==================================================
 # WEBHOOK
@@ -184,23 +179,23 @@ def process_call(activity_id: int, attempt: int = 1):
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
-        logger.info(f"RAW WEBHOOK: {data}")
+        logger.info("RAW WEBHOOK: %s", data)
 
-        # ---- AUTH ----
-        app_token = data.get("auth", {}).get("application_token")
-        if app_token != EXPECTED_APP_TOKEN:
-            logger.warning(f"Неверный application_token: {app_token}")
+        token = data.get("auth", {}).get("application_token")
+        if token != EXPECTED_APP_TOKEN:
+            logger.warning("Invalid application_token: %s", token)
             return jsonify({"status": "forbidden"}), 403
 
         event = data.get("event")
         fields = data.get("data", {}).get("FIELDS", {})
-        logger.info(f"EVENT: {event}")
+        logger.info("EVENT: %s", event)
 
-        if event in ("ONCRMACTIVITYADD", "ONCRMACTIVITYUPDATE"):
-            activity_id = fields.get("ID")
-            provider = fields.get("PROVIDER_ID")
-            if activity_id and provider == "VOXIMPLANT_CALL":
-                threading.Thread(target=process_call, args=(int(activity_id),), daemon=True).start()
+        activity_id = fields.get("ID")
+        provider = fields.get("PROVIDER_ID")
+
+        # Обрабатываем все звонки
+        if activity_id and provider in ("VOXIMPLANT_CALL", "ASTERISK_CALL", "CALL"):
+            threading.Thread(target=process_call, args=(int(activity_id),), daemon=True).start()
 
         return jsonify({"status": "ok"}), 200
 

@@ -71,6 +71,44 @@ def save_transcript(path: str, segments: List[Dict[str, Any]], fallback_text: st
     except Exception as e:
         logger.exception("Error saving transcript %s: %s", path, e)
 
+def build_bitrix_comment(
+    activity_id: int,
+    full_text: str,
+    script_res: Dict[str, List[str]],
+    interests: Dict[str, int],
+    informative: bool,
+    duration: float
+) -> str:
+    lines = []
+    lines.append("📞 Анализ звонка (автоматически)")
+    lines.append("")
+    lines.append(f"🔹 Информативный звонок: {'ДА' if informative else 'НЕТ'}")
+    lines.append(f"🔹 Длительность: {int(duration)} сек")
+    lines.append("")
+    lines.append("🧾 Скрипт:")
+
+    for p in script_res.get("found", []):
+        lines.append(f"✔ {p}")
+    for p in script_res.get("missed", []):
+        lines.append(f"❌ {p}")
+
+    lines.append("")
+    if interests:
+        lines.append("🧠 Интересы клиента:")
+        lines.append(", ".join(f"{k} ({v})" for k, v in interests.items()))
+    else:
+        lines.append("🧠 Интересы клиента: не выявлены")
+
+    snippet = full_text.strip().replace("\n", " ")
+    if snippet:
+        lines.append("")
+        lines.append("📝 Фрагмент разговора:")
+        lines.append(snippet[:500] + ("..." if len(snippet) > 500 else ""))
+
+    lines.append("")
+    lines.append(f"🆔 ID звонка (CRM Activity): {activity_id}")
+
+    return "\n".join(lines)
 
 def save_summary(path: str,
                  full_text: str,

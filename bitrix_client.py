@@ -2,94 +2,141 @@ import os
 import requests
 import logging
 import configparser
-from typing import Dict
+from typing import Dict, List, Optional
+import base64
 
-# ------------------------
-# Конфиг
-# ------------------------
+# ========================
+# CONFIG
+# ========================
 cfg = configparser.ConfigParser()
 cfg.read("config.ini", encoding="utf-8")
 
-BITRIX_WEBHOOK = cfg.get("BITRIX", "webhook_url")
-AUDIO_BASE_URL = cfg.get("BITRIX", "audio_base_url")
+BITRIX_WEBHOOK = cfg.get("BITRIX", "webhook_url").rstrip("/") + "/"
 TMP_DIR = cfg.get("BITRIX", "tmp_dir", fallback=os.path.join(os.getcwd(), "tmp"))
 
 os.makedirs(TMP_DIR, exist_ok=True)
-logger = logging.getLogger("analyzer")
+
+logger = logging.getLogger("bitrix_client")
+
 
 class BitrixClient:
-    def __init__(self):
-        self.webhook_url = BITRIX_WEBHOOK.rstrip("/") + "/"
+    ENTITY_MAP = {
+        1: "lead",
+        2: "deal",
+        3: "contact",
+        4: "company",
+        5: "order",
+        # dynamic объекты можно добавить по необходимости
+    }
 
-    # ------------------------
-    # Получение CRM активности по ID
-    # ------------------------
+    def __init__(self):
+        self.webhook_url = BITRIX_WEBHOOK
+
+    # -------------------------------------------------
+    # Получение CRM активности
+    # -------------------------------------------------
     def get_call_activity(self, activity_id: int) -> Dict:
         url = self.webhook_url + "crm.activity.get.json"
-        resp = requests.get(url, params={"id": activity_id})
-        if resp.status_code != 200:
-            logger.error("Failed to get activity %s: %s", activity_id, resp.text)
+        try:
+            resp = requests.get(url, params={"id": activity_id}, timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("result", {}) or {}
+        except Exception:
+            logger.exception("crm.activity.get failed %s", activity_id)
             return {}
-        return resp.json().get("result", {})
 
-    # ------------------------
-    # Поиск активности по CALL_ID (Origin ID телефонии)
-    # ------------------------
-    def find_activity_by_call_id(self, call_id: str) -> Dict:
-        url = self.webhook_url + "crm.activity.list.json"
-        params = {
-            "filter": {"TYPE_ID": 2, "ORIGIN_ID": call_id},
-            "select": ["ID","OWNER_ID","OWNER_TYPE_ID","FILES"]
-        }
-        resp = requests.post(url, json=params)
-        if resp.status_code != 200:
-            logger.error("Failed to find activity by CALL_ID %s: %s", call_id, resp.text)
-            return {}
-        items = resp.json().get("result", [])
-        return items[0] if items else {}
+    # -------------------------------------------------
+    # Получение DOWNLOAD_URL через Disk API
+    # -------------------------------------------------
+    def get_disk_download_url(self, file_id: str) -> str:
+        url = self.webhook_url + "disk.file.get.json"
+        try:
+            resp = requests.get(url, params={"id": file_id}, timeout=30)
+            resp.raise_for_status()
+            result = resp.json().get("result", {}) or {}
+            return result.get("DOWNLOAD_URL", "")
+        except Exception:
+            logger.exception("disk.file.get failed %s", file_id)
+            return ""
 
-    # ------------------------
-    # Скачивание аудио по fileId
-    # ------------------------
-    def download_audio(self, file_id: str, file_url: str = None) -> str:
-        url = file_url if file_url else f"{AUDIO_BASE_URL}{file_id}"
+    # -------------------------------------------------
+    # Скачивание аудио
+    # -------------------------------------------------
+    def download_audio(self, file_id: str) -> str:
         local_path = os.path.join(TMP_DIR, f"{file_id}.mp3")
         try:
-            resp = requests.get(url, stream=True)
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            logger.info("Downloaded audio: %s", local_path)
+            download_url = self.get_disk_download_url(file_id)
+            if not download_url:
+                logger.error("No DOWNLOAD_URL for file %s", file_id)
+                return ""
+
+            with requests.get(download_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                content_type = r.headers.get("Content-Type", "")
+                if "audio" not in content_type and "octet-stream" not in content_type:
+                    logger.error("Invalid content-type for %s: %s", file_id, content_type)
+                    return ""
+
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        if chunk:
+                            f.write(chunk)
+
+            if os.path.getsize(local_path) < 1024:
+                logger.error("Downloaded file too small: %s", local_path)
+                return ""
+
+            logger.info("Audio downloaded: %s", local_path)
             return local_path
-        except requests.HTTPError as e:
-            logger.error("Error downloading MP3 %s: %s", file_id, e)
-            return ""
-        except Exception as e:
-            logger.error("Unexpected error downloading MP3 %s: %s", file_id, e)
+
+        except Exception:
+            logger.exception("Error downloading audio %s", file_id)
             return ""
 
-    # ------------------------
-    # Добавление комментария в карточку лида/сделки
-    # ------------------------
-    def add_comment(self, owner_type_id: int, owner_id: int, text: str):
+    # -------------------------------------------------
+    # Добавление комментария в таймлайн
+    # -------------------------------------------------
+    def add_comment(
+        self,
+        owner_type_id: int,
+        owner_id: int,
+        text: str,
+        files: Optional[List[List[str]]] = None
+    ):
+        """
+        Добавляет комментарий к сущности (Lead/Deal/Contact и т.д.) через crm.timeline.comment.add.
+        files: список [ [название файла, base64 содержимое], ...]
+        """
         url = self.webhook_url + "crm.timeline.comment.add.json"
-        data = {"fields": {"ENTITY_TYPE_ID": owner_type_id, "ENTITY_ID": owner_id, "COMMENT": text}}
-        resp = requests.post(url, json=data)
-        if resp.status_code != 200:
-            logger.error("Failed to add timeline comment to %s %s: %s", owner_type_id, owner_id, resp.text)
-        else:
-            logger.info("Added timeline comment to %s %s", owner_type_id, owner_id)
+        entity_type = self.ENTITY_MAP.get(owner_type_id, "lead")
 
-    # ------------------------
-    # Обновление пользовательских полей
-    # ------------------------
-    def update_fields(self, entity_id: int, fields: Dict, entity_type="lead"):
-        method = "crm.lead.update.json" if entity_type=="lead" else "crm.deal.update.json"
-        url = self.webhook_url + method
-        data = {"id": entity_id, "fields": fields}
-        resp = requests.post(url, json=data)
-        if resp.status_code != 200:
-            logger.error("Failed to update %s %s: %s", entity_type, entity_id, resp.text)
-        else:
-            logger.info("Updated %s %s fields: %s", entity_type, entity_id, fields)
+        payload = {
+            "fields": {
+                "ENTITY_TYPE": entity_type,
+                "ENTITY_ID": owner_id,
+                "COMMENT": text,
+                "FILES": files or []
+            }
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            if resp.status_code != 200:
+                logger.error("Failed to add comment %s %s: %s", entity_type, owner_id, resp.text)
+            else:
+                logger.info("Timeline comment added to %s %s", entity_type, owner_id)
+                logger.debug("Bitrix response: %s", resp.json())
+        except Exception:
+            logger.exception("Exception adding comment to %s %s", entity_type, owner_id)
+
+    # -------------------------------------------------
+    # Утилита для прикрепления локального файла в base64
+    # -------------------------------------------------
+    @staticmethod
+    def encode_file_base64(file_path: str) -> str:
+        try:
+            with open(file_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        except Exception:
+            logger.exception("Failed to encode file %s", file_path)
+            return ""
