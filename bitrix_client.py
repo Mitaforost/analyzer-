@@ -20,44 +20,68 @@ logger = logging.getLogger("bitrix_client")
 
 
 class BitrixClient:
+    # Типы сущностей для Bitrix (верхний регистр!)
     ENTITY_MAP = {
-        1: "lead",
-        2: "deal",
-        3: "contact",
-        4: "company",
-        5: "order",
-        # dynamic объекты можно добавить по необходимости
+        1: "LEAD",
+        2: "DEAL",
+        3: "CONTACT",
+        4: "COMPANY",
+        5: "ORDER",
     }
 
     def __init__(self):
         self.webhook_url = BITRIX_WEBHOOK
 
     # -------------------------------------------------
+    # Универсальный вызов API Bitrix
+    # -------------------------------------------------
+    def call_api(self, method: str, params: dict, post: bool = False) -> dict:
+        """
+        Универсальный вызов REST API.
+        Если post=True, делаем POST, иначе GET.
+        """
+        url = self.webhook_url + method + ".json"
+        try:
+            if post:
+                resp = requests.post(url, json=params, timeout=30)
+            else:
+                resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                logger.error("Bitrix API error %s: %s", method, data)
+            return data.get("result", {}) or {}
+        except Exception:
+            logger.exception("Bitrix API call failed: %s %s", method, params)
+            return {}
+
+    # -------------------------------------------------
     # Получение CRM активности
     # -------------------------------------------------
-    def get_call_activity(self, activity_id: int) -> Dict:
-        url = self.webhook_url + "crm.activity.get.json"
-        try:
-            resp = requests.get(url, params={"id": activity_id}, timeout=30)
-            resp.raise_for_status()
-            return resp.json().get("result", {}) or {}
-        except Exception:
-            logger.exception("crm.activity.get failed %s", activity_id)
-            return {}
+    def get_call_activity(self, activity_id: int):
+        result = self.call_api(
+            "crm.activity.list",
+            {
+                "filter": {"ID": activity_id},
+                "select": ["*", "BINDINGS", "COMMUNICATIONS"]
+            },
+            post=True  # 🔥 ВАЖНО: ТОЛЬКО POST
+        )
+
+        if not result:
+            return None
+
+        if isinstance(result, list) and result:
+            return result[0]
+
+        return None
 
     # -------------------------------------------------
     # Получение DOWNLOAD_URL через Disk API
     # -------------------------------------------------
     def get_disk_download_url(self, file_id: str) -> str:
-        url = self.webhook_url + "disk.file.get.json"
-        try:
-            resp = requests.get(url, params={"id": file_id}, timeout=30)
-            resp.raise_for_status()
-            result = resp.json().get("result", {}) or {}
-            return result.get("DOWNLOAD_URL", "")
-        except Exception:
-            logger.exception("disk.file.get failed %s", file_id)
-            return ""
+        result = self.call_api("disk.file.get", {"id": file_id})
+        return result.get("DOWNLOAD_URL", "")
 
     # -------------------------------------------------
     # Скачивание аудио
@@ -97,37 +121,32 @@ class BitrixClient:
     # Добавление комментария в таймлайн
     # -------------------------------------------------
     def add_comment(
-        self,
-        owner_type_id: int,
-        owner_id: int,
-        text: str,
-        files: Optional[List[List[str]]] = None
+            self,
+            owner_type_id: int,
+            owner_id: int,
+            text: str,
+            files: Optional[List[List[str]]] = None
     ):
         """
-        Добавляет комментарий к сущности (Lead/Deal/Contact и т.д.) через crm.timeline.comment.add.
-        files: список [ [название файла, base64 содержимое], ...]
+        Добавляет комментарий через crm.timeline.comment.add
         """
-        url = self.webhook_url + "crm.timeline.comment.add.json"
-        entity_type = self.ENTITY_MAP.get(owner_type_id, "lead")
 
         payload = {
             "fields": {
-                "ENTITY_TYPE": entity_type,
+                "ENTITY_TYPE_ID": owner_type_id,  # <-- ВАЖНО
                 "ENTITY_ID": owner_id,
-                "COMMENT": text,
-                "FILES": files or []
+                "COMMENT": text
             }
         }
 
-        try:
-            resp = requests.post(url, json=payload, timeout=30)
-            if resp.status_code != 200:
-                logger.error("Failed to add comment %s %s: %s", entity_type, owner_id, resp.text)
-            else:
-                logger.info("Timeline comment added to %s %s", entity_type, owner_id)
-                logger.debug("Bitrix response: %s", resp.json())
-        except Exception:
-            logger.exception("Exception adding comment to %s %s", entity_type, owner_id)
+        if files:
+            payload["fields"]["FILES"] = files
+
+        return self.call_api(
+            "crm.timeline.comment.add",
+            payload,
+            post=True
+        )
 
     # -------------------------------------------------
     # Утилита для прикрепления локального файла в base64

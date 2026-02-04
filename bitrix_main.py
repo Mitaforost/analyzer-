@@ -6,6 +6,8 @@ import configparser
 import tempfile
 import threading
 from datetime import datetime
+import glob
+import json
 
 from flask import Flask, request, jsonify
 import torch
@@ -28,12 +30,6 @@ WHISPER_MODEL = cfg.get("WHISPER", "model")
 EXPECTED_APP_TOKEN = cfg.get("BITRIX", "outgoing_app_token")
 TMP_DIR = cfg.get("BITRIX", "tmp_dir", fallback=tempfile.gettempdir())
 
-REQUIRED_PHRASES = [
-    p.strip()
-    for p in cfg.get("SCRIPT", "required_phrases").split(",")
-    if p.strip()
-]
-
 os.makedirs(TMP_DIR, exist_ok=True)
 
 # ==================================================
@@ -42,7 +38,7 @@ os.makedirs(TMP_DIR, exist_ok=True)
 logger = logging.getLogger("bitrix_main")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
 logger.handlers.clear()
 logger.addHandler(handler)
 
@@ -57,6 +53,9 @@ client = BitrixClient()
 # ==================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 whisper_engine = WhisperEngine(model_name=WHISPER_MODEL, device=device)
+
+# 🔒 ВАЖНО: защита Whisper от параллельного доступа
+WHISPER_LOCK = threading.Lock()
 
 # ==================================================
 # FALLBACK DIARIZER
@@ -80,9 +79,20 @@ diarizer = SimpleFallbackDiarizer()
 # INTERNAL SETTINGS
 # ==================================================
 MAX_RETRY = 15
-RETRY_DELAY = 60  # секунд
+RETRY_DELAY = 20
 PROCESSING = set()
 LOCK = threading.Lock()
+
+# ==================================================
+# LOAD SALES SCRIPTS
+# ==================================================
+SCRIPTS = []
+for fpath in glob.glob("scripts/*.json"):
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            SCRIPTS.append(json.load(f))
+    except Exception:
+        logger.exception("Failed to load script %s", fpath)
 
 # ==================================================
 # HELPERS
@@ -99,19 +109,55 @@ def extract_file_id(activity: dict) -> str | None:
         return str(storage_ids[0])
 
     settings = activity.get("SETTINGS") or {}
-    for key in ("FILE_ID", "RECORD_ID"):
-        if key in settings:
-            return str(settings[key])
+    for key in ("FILE_ID", "RECORD_ID", "CALL_RECORD_ID", "CALL_RECORD_FILE_ID"):
+        val = settings.get(key)
+        if val:
+            return str(val)
 
     return None
 
+
+def choose_best_script(full_text: str):
+    best_score = 0.0
+    best_script = None
+    best_result = None
+
+    for script in SCRIPTS:
+        result = analyze_script_presence(full_text, script.get("phrases", [])) \
+                 or {"found": [], "missed": []}
+
+        score = len(result["found"]) / max(len(script.get("phrases", [])), 1)
+
+        if score > best_score:
+            best_score = score
+            best_script = script
+            best_result = result
+
+    return best_script, best_result
+
+
+def download_call_audio(activity: dict, file_id: str) -> str | None:
+    if not file_id:
+        logger.info(f"[{activity.get('ID')}] Нет FILE_ID")
+        return None
+
+    audio_path = client.download_audio(file_id)
+
+    if not audio_path:
+        logger.info(f"[{activity.get('ID')}] Ошибка скачивания FILE_ID {file_id}")
+
+    return audio_path
+
+
 # ==================================================
-# CALL PROCESSOR
+# PROCESS CALL
 # ==================================================
 def process_call(activity_id: int):
+
+    # защита от повторной обработки
     with LOCK:
         if activity_id in PROCESSING:
-            logger.info("[%s] Already processing", activity_id)
+            logger.info(f"[{activity_id}] Already processing")
             return
         PROCESSING.add(activity_id)
 
@@ -119,87 +165,177 @@ def process_call(activity_id: int):
     audio_path = None
 
     try:
-        logger.info("[%s] Processing started", activity_id)
         activity = None
         file_id = None
+        call_type = "Не определён"
 
-        # ---------- WAIT FOR FILE ----------
+        # ==============================
+        # Ждём появления записи звонка
+        # ==============================
         for attempt in range(1, MAX_RETRY + 1):
+
             activity = client.get_call_activity(activity_id)
+
             if not activity:
-                logger.info("[%s] Activity not ready (%s/%s)", activity_id, attempt, MAX_RETRY)
                 time.sleep(RETRY_DELAY)
                 continue
 
+            if str(activity.get("TYPE_ID")) != "2":
+                logger.info(f"[{activity_id}] Not a call activity")
+                return
+
+            direction = str(activity.get("DIRECTION"))
+            call_type = "Входящий" if direction == "1" else "Исходящий"
+
+            duration = int(activity.get("DURATION") or 0)
+            minutes = duration // 60
+            seconds = duration % 60
+
+            logger.info(
+                f"[{activity_id}] {call_type} | {minutes}м {seconds:02d}с"
+            )
+
             file_id = extract_file_id(activity)
+
             if file_id:
+                logger.info(f"[{activity_id}] Найден FILE_ID: {file_id}")
                 break
 
-            logger.info("[%s] MP3 not ready (%s/%s)", activity_id, attempt, MAX_RETRY)
             time.sleep(RETRY_DELAY)
 
         if not file_id:
-            logger.error("[%s] MP3 not found after retries", activity_id)
+            logger.warning(f"[{activity_id}] Файл так и не появился")
             return
 
-        logger.info("[%s] FILE_ID: %s", activity_id, file_id)
-
-        # ---------- DOWNLOAD ----------
-        audio_path = client.download_audio(file_id)
+        # ==============================
+        # Скачиваем аудио
+        # ==============================
+        audio_path = download_call_audio(activity, file_id)
         if not audio_path:
-            logger.error("[%s] Audio download failed", activity_id)
             return
 
-        # ---------- WHISPER ----------
+        if os.path.getsize(audio_path) < 5000:
+            logger.info(f"[{activity_id}] Файл слишком маленький")
+            return
+
+        # ==============================
+        # WHISPER (с LOCK!)
+        # ==============================
         try:
-            segments = whisper_engine.transcribe_segments(audio_path)
-            full_text = " ".join(s.get("text", "") for s in segments).strip()
-        except Exception:
-            logger.exception("[%s] Whisper error", activity_id)
+            with WHISPER_LOCK:
+                segments = whisper_engine.transcribe_segments(audio_path)
+
+            full_text = " ".join(
+                s.get("text", "") for s in segments
+            ).strip()
+
+        except Exception as e:
+            logger.warning(f"[{activity_id}] Whisper failed: {e}")
             segments = []
             full_text = ""
 
-        # ---------- DIARIZATION ----------
+        # ==============================
+        # АНАЛИЗ
+        # ==============================
         diar_segments, _ = diarizer.diarize(audio_path)
 
-        # ---------- ANALYSIS ----------
-        script_result = analyze_script_presence(full_text, REQUIRED_PHRASES)
-        InterestsPlugin().analyze(full_text, diar_segments)
+        best_script, script_result = choose_best_script(full_text)
+
+        if not script_result:
+            script_result = {"found": [], "missed": []}
+
+        script_name = best_script.get("name") if best_script else "Не определено"
+
+        interests = InterestsPlugin().analyze(full_text, diar_segments) or {}
         informative = is_informational_call(full_text)
 
-        owner_id = activity.get("OWNER_ID")
-        owner_type = activity.get("OWNER_TYPE_ID")
+        # ==============================
+        # ПОИСК CRM-СУЩНОСТИ (НАДЁЖНЫЙ)
+        # ==============================
+        owner_id = None
+        owner_type = None
+
+        # 1️⃣ BINDINGS
+        bindings = activity.get("BINDINGS") or []
+        for b in bindings:
+            if b.get("OWNER_ID") and b.get("OWNER_TYPE_ID"):
+                owner_id = b["OWNER_ID"]
+                owner_type = b["OWNER_TYPE_ID"]
+                break
+
+        # 2️⃣ OWNER_ID / OWNER_TYPE_ID
+        if not owner_id:
+            if activity.get("OWNER_ID") and activity.get("OWNER_TYPE_ID"):
+                owner_id = activity["OWNER_ID"]
+                owner_type = activity["OWNER_TYPE_ID"]
+
+        # 3️⃣ SETTINGS
+        if not owner_id:
+            settings = activity.get("SETTINGS") or {}
+            if settings.get("CRM_ENTITY_ID") and settings.get("CRM_ENTITY_TYPE"):
+                owner_id = settings["CRM_ENTITY_ID"]
+                owner_type = settings["CRM_ENTITY_TYPE"]
+
+        # 4️⃣ COMMUNICATIONS
+        if not owner_id:
+            communications = activity.get("COMMUNICATIONS") or []
+            for c in communications:
+                if c.get("ENTITY_ID") and c.get("ENTITY_TYPE_ID"):
+                    owner_id = c["ENTITY_ID"]
+                    owner_type = c["ENTITY_TYPE_ID"]
+                    break
 
         if not owner_id or not owner_type:
-            logger.warning("[%s] No CRM owner, skipping comment", activity_id)
+            logger.warning(
+                f"[{activity_id}] Не удалось определить CRM-сущность для комментария"
+            )
             return
 
-        comment_lines = [
-            "📞 Автоматический анализ звонка",
-            f"Скрипт: {len(script_result.get('found', []))}/{len(REQUIRED_PHRASES)}",
+        owner_type = int(owner_type)
+
+        logger.info(
+            f"[{activity_id}] Добавляем комментарий в "
+            f"OWNER_TYPE_ID={owner_type} OWNER_ID={owner_id}"
+        )
+
+        # ==============================
+        # Формируем комментарий
+        # ==============================
+        total_phrases = len(script_result["found"]) + len(script_result["missed"])
+
+        comment_text = "\n".join([
+            f"Тип звонка: {call_type}",
+            f"Скрипт: {script_name}",
+            f"Скрипт выполнен: {len(script_result['found'])}/{total_phrases}",
             f"Информативный: {'Да' if informative else 'Нет'}",
-            f"Пропущенные фразы: {', '.join(script_result.get('missed', [])) or '—'}"
-        ]
-        comment_text = "\n".join(comment_lines)
+            f"Пропущенные фразы: "
+            f"{', '.join(script_result['missed']) or '—'}",
+            f"Интересы клиента: "
+            f"{', '.join(f'{k}({v})' for k, v in interests.items()) or 'не выявлены'}"
+        ])
 
-        logger.info("[%s] Sending comment", activity_id)
-        client.add_comment(owner_type, owner_id, comment_text)
-        logger.info("[%s] Done", activity_id)
+        result = client.add_comment(owner_type, owner_id, comment_text)
 
-    except Exception:
-        logger.exception("[%s] Critical error", activity_id)
+        logger.info(f"[{activity_id}] Ответ Bitrix: {result}")
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.info(f"[{activity_id}] ✔ Анализ завершён за {elapsed:.1f} сек")
+
+    except Exception as e:
+        logger.exception(f"[{activity_id}] Critical error: {e}")
 
     finally:
         with LOCK:
             PROCESSING.discard(activity_id)
+
         if audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
             except Exception:
                 pass
+
         gc.collect()
-        elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info("[%s] Finished in %.1f sec", activity_id, elapsed)
+
 
 # ==================================================
 # WEBHOOK
@@ -207,28 +343,20 @@ def process_call(activity_id: int):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # Bitrix шлёт form-data
         data = request.form.to_dict()
-        logger.info("RAW WEBHOOK: %s", data)
 
-        # --- Проверка токена ---
         token = data.get("auth[application_token]")
         if token != EXPECTED_APP_TOKEN:
-            logger.warning("Invalid token: %s", token)
             return jsonify({"status": "forbidden"}), 403
 
-        # --- Получаем ID активности ---
         activity_id = data.get("data[FIELDS][ID]")
         event = data.get("event")
 
-        if not activity_id:
+        if not activity_id or event not in (
+                "ONCRMACTIVITYADD",
+                "ONCRMACTIVITYUPDATE"
+        ):
             return jsonify({"status": "ignored"}), 200
-
-        # Нам интересны только события по звонкам
-        if event not in ("ONCRMACTIVITYADD", "ONCRMACTIVITYUPDATE"):
-            return jsonify({"status": "ignored"}), 200
-
-        logger.info("Activity ID received: %s", activity_id)
 
         threading.Thread(
             target=process_call,
@@ -239,13 +367,12 @@ def webhook():
         return jsonify({"status": "ok"}), 200
 
     except Exception:
-        logger.exception("Webhook error")
         return jsonify({"status": "error"}), 500
 
 
 # ==================================================
-# RUN
+# RUN SERVER
 # ==================================================
 if __name__ == "__main__":
-    logger.info("🚀 Flask webhook: 0.0.0.0:5000")
+    logger.info("Webhook server started on 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)
