@@ -16,9 +16,12 @@ from core.whisper_engine import WhisperEngine
 from core.analyzers import (
     analyze_script_presence,
     InterestsPlugin,
+    ManagerPerformanceAnalyzer,
     is_informational_call
 )
+
 from bitrix_client import BitrixClient
+from core import reporter
 
 # ==================================================
 # CONFIG
@@ -161,13 +164,14 @@ def process_call(activity_id: int):
             return
         PROCESSING.add(activity_id)
 
-    start_time = datetime.now()
     audio_path = None
+    start_time = datetime.now()
 
     try:
         activity = None
         file_id = None
         call_type = "Не определён"
+        duration = 0
 
         # ==============================
         # Ждём появления записи звонка
@@ -186,17 +190,9 @@ def process_call(activity_id: int):
 
             direction = str(activity.get("DIRECTION"))
             call_type = "Входящий" if direction == "1" else "Исходящий"
-
             duration = int(activity.get("DURATION") or 0)
-            minutes = duration // 60
-            seconds = duration % 60
-
-            logger.info(
-                f"[{activity_id}] {call_type} | {minutes}м {seconds:02d}с"
-            )
 
             file_id = extract_file_id(activity)
-
             if file_id:
                 logger.info(f"[{activity_id}] Найден FILE_ID: {file_id}")
                 break
@@ -211,53 +207,64 @@ def process_call(activity_id: int):
         # Скачиваем аудио
         # ==============================
         audio_path = download_call_audio(activity, file_id)
-        if not audio_path:
-            return
-
-        if os.path.getsize(audio_path) < 5000:
-            logger.info(f"[{activity_id}] Файл слишком маленький")
+        if not audio_path or os.path.getsize(audio_path) < 5000:
+            logger.warning(f"[{activity_id}] Аудио отсутствует или слишком маленькое")
             return
 
         # ==============================
-        # WHISPER (с LOCK!)
+        # WHISPER (строго под LOCK)
         # ==============================
         try:
             with WHISPER_LOCK:
-                segments = whisper_engine.transcribe_segments(audio_path)
+                whisper_segments = whisper_engine.transcribe_segments(audio_path)
 
             full_text = " ".join(
-                s.get("text", "") for s in segments
+                s.get("text", "") for s in whisper_segments
             ).strip()
 
         except Exception as e:
-            logger.warning(f"[{activity_id}] Whisper failed: {e}")
-            segments = []
-            full_text = ""
+            logger.exception(f"[{activity_id}] Whisper failed")
+            return
+
+        if not full_text:
+            logger.warning(f"[{activity_id}] Пустой транскрипт")
+            return
 
         # ==============================
-        # АНАЛИЗ
+        # ДИАРИЗАЦИЯ
         # ==============================
         diar_segments, _ = diarizer.diarize(audio_path)
 
+        # ==============================
+        # СКРИПТ
+        # ==============================
         best_script, script_result = choose_best_script(full_text)
-
         if not script_result:
             script_result = {"found": [], "missed": []}
 
-        script_name = best_script.get("name") if best_script else "Не определено"
-
+        # ==============================
+        # ИНТЕРЕСЫ
+        # ==============================
         interests = InterestsPlugin().analyze(full_text, diar_segments) or {}
-        informative = is_informational_call(full_text)
 
         # ==============================
-        # ПОИСК CRM-СУЩНОСТИ (НАДЁЖНЫЙ)
+        # АНАЛИТИКА МЕНЕДЖЕРА
+        # ==============================
+        metrics = {}
+        try:
+            performance = ManagerPerformanceAnalyzer(best_script)
+            metrics = performance.analyze(full_text, diar_segments)
+        except Exception:
+            logger.exception(f"[{activity_id}] Manager analytics failed")
+
+        # ==============================
+        # ПОИСК CRM-СУЩНОСТИ (КРИТИЧНО!)
         # ==============================
         owner_id = None
         owner_type = None
 
         # 1️⃣ BINDINGS
-        bindings = activity.get("BINDINGS") or []
-        for b in bindings:
+        for b in activity.get("BINDINGS") or []:
             if b.get("OWNER_ID") and b.get("OWNER_TYPE_ID"):
                 owner_id = b["OWNER_ID"]
                 owner_type = b["OWNER_TYPE_ID"]
@@ -278,17 +285,14 @@ def process_call(activity_id: int):
 
         # 4️⃣ COMMUNICATIONS
         if not owner_id:
-            communications = activity.get("COMMUNICATIONS") or []
-            for c in communications:
+            for c in activity.get("COMMUNICATIONS") or []:
                 if c.get("ENTITY_ID") and c.get("ENTITY_TYPE_ID"):
                     owner_id = c["ENTITY_ID"]
                     owner_type = c["ENTITY_TYPE_ID"]
                     break
 
         if not owner_id or not owner_type:
-            logger.warning(
-                f"[{activity_id}] Не удалось определить CRM-сущность для комментария"
-            )
+            logger.warning(f"[{activity_id}] CRM-сущность не найдена")
             return
 
         owner_type = int(owner_type)
@@ -299,30 +303,28 @@ def process_call(activity_id: int):
         )
 
         # ==============================
-        # Формируем комментарий
+        # ФОРМИРОВАНИЕ КОММЕНТАРИЯ
         # ==============================
-        total_phrases = len(script_result["found"]) + len(script_result["missed"])
-
-        comment_text = "\n".join([
-            f"Тип звонка: {call_type}",
-            f"Скрипт: {script_name}",
-            f"Скрипт выполнен: {len(script_result['found'])}/{total_phrases}",
-            f"Информативный: {'Да' if informative else 'Нет'}",
-            f"Пропущенные фразы: "
-            f"{', '.join(script_result['missed']) or '—'}",
-            f"Интересы клиента: "
-            f"{', '.join(f'{k}({v})' for k, v in interests.items()) or 'не выявлены'}"
-        ])
+        comment_text = reporter.build_bitrix_comment(
+            activity_id=activity_id,
+            call_type=call_type,
+            duration=duration,
+            full_text=full_text,
+            script_res=script_result,
+            interests=interests,
+            segments=whisper_segments,
+            metrics=metrics,
+            informative=is_informational_call(full_text)
+        )
 
         result = client.add_comment(owner_type, owner_id, comment_text)
-
-        logger.info(f"[{activity_id}] Ответ Bitrix: {result}")
+        logger.info(f"[{activity_id}] Bitrix response: {result}")
 
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{activity_id}] ✔ Анализ завершён за {elapsed:.1f} сек")
 
-    except Exception as e:
-        logger.exception(f"[{activity_id}] Critical error: {e}")
+    except Exception:
+        logger.exception(f"[{activity_id}] Critical error")
 
     finally:
         with LOCK:

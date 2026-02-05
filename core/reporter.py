@@ -71,42 +71,69 @@ def save_transcript(path: str, segments: List[Dict[str, Any]], fallback_text: st
     except Exception as e:
         logger.exception("Error saving transcript %s: %s", path, e)
 
+
 def build_bitrix_comment(
     activity_id: int,
+    call_type: str,
+    duration: int,
     full_text: str,
-    script_res: Dict[str, List[str]],
-    interests: Dict[str, int],
-    informative: bool,
-    duration: float
+    script_res: dict,
+    interests: dict,
+    segments: list,
+    metrics: dict,
+    informative: bool = None
 ) -> str:
+
     lines = []
-    lines.append("📞 Анализ звонка (автоматически)")
-    lines.append("")
-    lines.append(f"🔹 Информативный звонок: {'ДА' if informative else 'НЕТ'}")
-    lines.append(f"🔹 Длительность: {int(duration)} сек")
-    lines.append("")
-    lines.append("🧾 Скрипт:")
 
-    for p in script_res.get("found", []):
-        lines.append(f"✔ {p}")
-    for p in script_res.get("missed", []):
-        lines.append(f"❌ {p}")
+    minutes = duration // 60
+    seconds = duration % 60
 
-    lines.append("")
+    lines.append(f"Тип звонка: {call_type}")
+    lines.append(f"Длительность: {minutes}м {seconds:02d}с")
+
+    # ==========================
+    # MANAGER METRICS
+    # ==========================
+    lines.append(f"Процент выполнения скрипта: {metrics.get('script_percent', 0)}%")
+    lines.append(f"Процент вежливости: {metrics.get('polite_percent', 0)}%")
+    lines.append(f"Продажа: {metrics.get('sales_score', 0)}%")
+
+    if metrics.get("promises"):
+        lines.append("Обещания: " + ", ".join(metrics["promises"]))
+
+    if metrics.get("speaker_times"):
+        lines.append("Время по ролям:")
+        for role, t in metrics["speaker_times"].items():
+            lines.append(f"{role}: {int(t)} сек")
+
+    # ==========================
+    # INTERESTS
+    # ==========================
     if interests:
-        lines.append("🧠 Интересы клиента:")
-        lines.append(", ".join(f"{k} ({v})" for k, v in interests.items()))
+        lines.append("Интересы клиента: " +
+                     ", ".join(f"{k}({v})" for k, v in interests.items()))
     else:
-        lines.append("🧠 Интересы клиента: не выявлены")
+        lines.append("Интересы клиента: не выявлены")
 
-    snippet = full_text.strip().replace("\n", " ")
-    if snippet:
-        lines.append("")
-        lines.append("📝 Фрагмент разговора:")
-        lines.append(snippet[:500] + ("..." if len(snippet) > 500 else ""))
+    if informative is not None:
+        lines.append(f"Информативный звонок: {'Да' if informative else 'Нет'}")
 
-    lines.append("")
-    lines.append(f"🆔 ID звонка (CRM Activity): {activity_id}")
+    # ==========================
+    # DIALOG
+    # ==========================
+    lines.append("Диалог:")
+
+    if segments:
+        for seg in segments:
+            role = seg.get("role") or seg.get("speaker") or "Спикер"
+            text = (seg.get("text") or "").strip()
+            if text:
+                lines.append(f"{role}: {text}")
+    else:
+        lines.append(full_text.strip())
+
+    lines.append(f"ID звонка: {activity_id}")
 
     return "\n".join(lines)
 
